@@ -1,4 +1,4 @@
-"""Real-time elbow inference — FINAL (ANGLE-DRIVEN FORM, NO BIAS)"""
+"""Real-time elbow inference — FINAL (STABLE + CORRECT + BALANCED SCORE)"""
 
 from collections import deque
 from pathlib import Path
@@ -15,19 +15,22 @@ from src.training.dataset import SEQUENCE_LENGTH
 
 # ================== TUNING ==================
 ANGLE_EMA_ALPHA = 0.25
-ANGLE_DEADZONE = 1.2
+ANGLE_DEADZONE = 1.0
 
 CALIBRATION_FRAMES = 40
 
-MIN_REP_FRAMES = 12
-REP_COOLDOWN = 8
+MIN_REP_FRAMES = 10
+REP_COOLDOWN = 6
 
-PROB_SMOOTH = 10
 DIRECTION_SMOOTH = 4
 
-# 🔥 KEY FIX: ROM thresholds (THIS FIXES YOUR PROBLEM)
-GOOD_ROM = 75
-BAD_ROM = 55
+# EARLY STATE
+UP_TRIGGER_OFFSET = 20
+DOWN_TRIGGER_OFFSET = 12
+
+# FORM (RELATIVE)
+GOOD_RATIO = 0.55
+BAD_RATIO = 0.35
 # ===========================================
 
 
@@ -49,8 +52,11 @@ class LiveRepTracker:
         # Calibration
         self.calibration = []
         self.calibrated = False
-        self.flexion = None
-        self.extension = None
+        self.min_angle = None
+        self.max_angle = None
+
+        self.up_trigger = None
+        self.down_trigger = None
 
         # Rep tracking
         self.rep_count = 0
@@ -60,16 +66,11 @@ class LiveRepTracker:
         self.rep_angles = []
         self.rep_velocities = []
 
-        # Model
-        self.prob_buffer = deque(maxlen=PROB_SMOOTH)
+        # Model (optional)
         self.last_prob = 0.5
 
-        # Form
-        self.form = "WAITING"
-        self.form_locked = False
-        self.frozen_form = "WAITING"
-
         # Output
+        self.form = "WAITING"
         self.last_rep_score = None
         self.last_rep_status = "WAITING"
 
@@ -135,9 +136,15 @@ class LiveRepTracker:
             if len(self.calibration) >= CALIBRATION_FRAMES:
                 mn, mx = min(self.calibration), max(self.calibration)
 
-                if mx - mn > 20:
-                    self.flexion = mn + 0.4 * (mx - mn)
-                    self.extension = mx - 0.25 * (mx - mn)
+                if mx - mn > 15:
+                    self.min_angle = mn
+                    self.max_angle = mx
+
+                    self.up_trigger = mx - UP_TRIGGER_OFFSET
+                    self.down_trigger = mx - DOWN_TRIGGER_OFFSET
+
+                    print("CALIBRATED:", mn, mx)
+
                     self.calibrated = True
 
             return self.result()
@@ -153,40 +160,49 @@ class LiveRepTracker:
         velocity = float(features[-1][1])
 
         # ===== STATE MACHINE =====
-        if self.direction == "UP" and angle < self.flexion:
-            self.state = "UP"
-            self.form_locked = False
+        if self.direction == "UP" and angle < self.up_trigger:
+            if self.state != "UP":
+                self.state = "UP"
+                self.rep_frames = 0
+                self.rep_angles = []
+                self.rep_velocities = []
 
-        elif self.direction == "DOWN" and angle > self.extension:
+        elif self.direction == "DOWN" and angle > self.down_trigger:
+
             if self.state == "UP" and self.rep_frames > MIN_REP_FRAMES and self.cooldown == 0:
 
                 self.rep_count += 1
 
-                # 🔥 FINAL FORM DECISION (ANGLE BASED)
                 rom = max(self.rep_angles) - min(self.rep_angles)
+                full_range = max(self.max_angle - self.min_angle, 1e-6)
+                ratio = rom / full_range
 
-                if rom >= GOOD_ROM:
-                    self.form = "Correct"
-                elif rom <= BAD_ROM:
-                    self.form = "Incorrect"
+                avg_speed = np.mean(self.rep_velocities) if self.rep_velocities else 0
+
+                # ===== FORM =====
+                # ===== FINAL BALANCED FORM =====
+                if ratio >= GOOD_RATIO:
+                 self.form = "Correct"
+
+                elif ratio <= BAD_RATIO:
+                 self.form = "Incorrect"
+
                 else:
-                    # borderline → use model
-                    if self.last_prob > 0.55:
-                        self.form = "Correct"
-                    else:
-                        self.form = "Incorrect"
+                # TRUE borderline zone (no bias)
+                 if self.last_prob > 0.55:
+                  self.form = "Correct"
+                 elif self.last_prob < 0.45:
+                  self.form = "Incorrect"
+                 else:
+                  self.form = "Uncertain"
 
-                # freeze result
-                self.frozen_form = self.form
-                self.form_locked = True
-
-                # score
-                score = self.score_rep(rom, velocity)
+                # ===== SCORE =====
+                score = self.score_rep(ratio, avg_speed)
                 self.last_rep_score = score
 
                 if score > 80:
                     self.last_rep_status = "EXCELLENT"
-                elif score > 55:
+                elif score > 60:
                     self.last_rep_status = "GOOD"
                 else:
                     self.last_rep_status = "BAD"
@@ -199,45 +215,37 @@ class LiveRepTracker:
         if self.cooldown > 0:
             self.cooldown -= 1
 
-        # collect rep
+        # ===== COLLECT =====
         if self.state == "UP":
             self.rep_frames += 1
             self.rep_angles.append(angle)
             self.rep_velocities.append(abs(velocity))
-        else:
-            self.rep_frames = 0
-            self.rep_angles = []
-            self.rep_velocities = []
 
-        # ===== MODEL (ONLY SUPPORT) =====
+        # ===== MODEL (optional) =====
         if predictor and len(self.sequence) == SEQUENCE_LENGTH:
             _, prob = predictor.predict_probability(np.array(self.sequence, dtype=np.float32))
-            self.prob_buffer.append(prob)
-            self.last_prob = float(np.mean(self.prob_buffer))
-
-        if self.form_locked:
-            self.form = self.frozen_form
+            self.last_prob = prob
 
         return self.result()
 
     # ================= SCORE =================
-    def score_rep(self, rom, velocity):
+    def score_rep(self, ratio, speed):
         score = 0
 
-        # ROM (main)
-        if rom > 100:
+        # ROM (relative)
+        if ratio >= 0.75:
             score += 60
-        elif rom > 80:
-            score += 45
-        elif rom > 60:
-            score += 25
+        elif ratio >= 0.6:
+            score += 50
+        elif ratio >= 0.45:
+            score += 35
         else:
-            score += 10
+            score += 20
 
         # SPEED
-        if velocity < 0.03:
+        if speed < 0.05:
             score += 30
-        elif velocity < 0.06:
+        elif speed < 0.08:
             score += 20
         else:
             score += 10
@@ -250,7 +258,6 @@ class LiveRepTracker:
             "state": self.state,
             "reps": self.rep_count,
             "form": self.form,
-            "prob": self.last_prob,
             "angle": self.last_angle or 0,
             "rep_score": self.last_rep_score,
             "rep_status": self.last_rep_status,
@@ -279,7 +286,6 @@ def run_live_camera(model_path):
                 )
 
             r = tracker.update(row, predictor)
-
             _draw(frame, r)
 
             cv2.imshow("Elbow AI", frame)
@@ -294,16 +300,13 @@ def run_live_camera(model_path):
 def _draw(frame, r):
     if r["form"] == "Correct":
         color = (0, 255, 0)
-    elif r["form"] == "Incorrect":
-        color = (0, 0, 255)
     else:
-        color = (0, 255, 255)
+        color = (0, 0, 255)
 
     cv2.putText(frame, f"Reps: {r['reps']}", (20, 40), 0, 0.8, color, 2)
     cv2.putText(frame, f"Form: {r['form']}", (20, 70), 0, 0.7, color, 2)
     cv2.putText(frame, f"Angle: {r['angle']:.1f}", (20, 100), 0, 0.7, (255,255,255), 2)
     cv2.putText(frame, f"State: {r['state']}", (20, 130), 0, 0.7, (255,255,255), 2)
-    cv2.putText(frame, f"Prob: {r['prob']:.2f}", (20, 160), 0, 0.6, (255,255,255), 2)
 
     if r["rep_status"] != "WAITING":
         cv2.putText(frame, f"{r['rep_status']} ({r['rep_score']})", (20, 200), 0, 0.8, (0,255,255), 2)
