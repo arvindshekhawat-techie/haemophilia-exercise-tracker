@@ -1,4 +1,4 @@
-"""Real-time elbow inference — FINAL (STABLE + CORRECT + BALANCED SCORE)"""
+"""Real-time elbow inference — FINAL (ANGLE RANGE BASED FORM FIX)"""
 
 from collections import deque
 from pathlib import Path
@@ -24,13 +24,8 @@ REP_COOLDOWN = 6
 
 DIRECTION_SMOOTH = 4
 
-# EARLY STATE
 UP_TRIGGER_OFFSET = 20
 DOWN_TRIGGER_OFFSET = 12
-
-# FORM (RELATIVE)
-GOOD_RATIO = 0.55
-BAD_RATIO = 0.35
 # ===========================================
 
 
@@ -49,7 +44,6 @@ class LiveRepTracker:
 
         self.state = "DOWN"
 
-        # Calibration
         self.calibration = []
         self.calibrated = False
         self.min_angle = None
@@ -58,7 +52,6 @@ class LiveRepTracker:
         self.up_trigger = None
         self.down_trigger = None
 
-        # Rep tracking
         self.rep_count = 0
         self.rep_frames = 0
         self.cooldown = 0
@@ -66,15 +59,12 @@ class LiveRepTracker:
         self.rep_angles = []
         self.rep_velocities = []
 
-        # Model (optional)
         self.last_prob = 0.5
 
-        # Output
         self.form = "WAITING"
         self.last_rep_score = None
         self.last_rep_status = "WAITING"
 
-    # ================= ANGLE =================
     def smooth_angle(self, shoulder, elbow, wrist):
         a, b, c = np.array(shoulder), np.array(elbow), np.array(wrist)
 
@@ -103,7 +93,6 @@ class LiveRepTracker:
         self.last_angle = self.ema_angle
         return self.last_angle
 
-    # ================= UPDATE =================
     def update(self, row, predictor=None):
         if row is None:
             return self.result()
@@ -117,7 +106,6 @@ class LiveRepTracker:
         self.angle_series.append(angle)
         self.rows.append(row)
 
-        # ===== DIRECTION =====
         if self.prev_angle is not None:
             if angle < self.prev_angle:
                 self.direction_buffer.append("UP")
@@ -159,7 +147,7 @@ class LiveRepTracker:
         self.sequence.append(features[-1])
         velocity = float(features[-1][1])
 
-        # ===== STATE MACHINE =====
+        # ===== STATE MACHINE (UNCHANGED) =====
         if self.direction == "UP" and angle < self.up_trigger:
             if self.state != "UP":
                 self.state = "UP"
@@ -174,29 +162,26 @@ class LiveRepTracker:
                 self.rep_count += 1
 
                 rom = max(self.rep_angles) - min(self.rep_angles)
+                min_angle_reached = min(self.rep_angles) if self.rep_angles else angle
+
                 full_range = max(self.max_angle - self.min_angle, 1e-6)
                 ratio = rom / full_range
 
                 avg_speed = np.mean(self.rep_velocities) if self.rep_velocities else 0
 
-                # ===== FORM =====
-                # ===== FINAL BALANCED FORM =====
-                if ratio >= GOOD_RATIO:
-                 self.form = "Correct"
-
-                elif ratio <= BAD_RATIO:
-                 self.form = "Incorrect"
-
+                # ================= 🔥 NEW FORM LOGIC =================
+                if 100 <= min_angle_reached <= 117:
+                    self.form = "Correct"
                 else:
-                # TRUE borderline zone (no bias)
-                 if self.last_prob > 0.55:
-                  self.form = "Correct"
-                 elif self.last_prob < 0.45:
-                  self.form = "Incorrect"
-                 else:
-                  self.form = "Uncertain"
+                    self.form = "Incorrect"
 
-                # ===== SCORE =====
+                # fallback (rare case)
+                if 95 < min_angle_reached < 122:
+                    if ratio < 0.25:
+                        self.form = "Incorrect"
+                # ====================================================
+
+                # ===== SCORE (UNCHANGED) =====
                 score = self.score_rep(ratio, avg_speed)
                 self.last_rep_score = score
 
@@ -211,28 +196,23 @@ class LiveRepTracker:
 
             self.state = "DOWN"
 
-        # cooldown
         if self.cooldown > 0:
             self.cooldown -= 1
 
-        # ===== COLLECT =====
         if self.state == "UP":
             self.rep_frames += 1
             self.rep_angles.append(angle)
             self.rep_velocities.append(abs(velocity))
 
-        # ===== MODEL (optional) =====
         if predictor and len(self.sequence) == SEQUENCE_LENGTH:
             _, prob = predictor.predict_probability(np.array(self.sequence, dtype=np.float32))
             self.last_prob = prob
 
         return self.result()
 
-    # ================= SCORE =================
     def score_rep(self, ratio, speed):
         score = 0
 
-        # ROM (relative)
         if ratio >= 0.75:
             score += 60
         elif ratio >= 0.6:
@@ -242,7 +222,6 @@ class LiveRepTracker:
         else:
             score += 20
 
-        # SPEED
         if speed < 0.05:
             score += 30
         elif speed < 0.08:
@@ -252,7 +231,6 @@ class LiveRepTracker:
 
         return min(score, 100)
 
-    # ================= OUTPUT =================
     def result(self):
         return {
             "state": self.state,
@@ -264,7 +242,6 @@ class LiveRepTracker:
         }
 
 
-# ================= CAMERA =================
 def run_live_camera(model_path):
     predictor = ElbowInference(model_path)
     tracker = LiveRepTracker()
@@ -300,8 +277,10 @@ def run_live_camera(model_path):
 def _draw(frame, r):
     if r["form"] == "Correct":
         color = (0, 255, 0)
-    else:
+    elif r["form"] == "Incorrect":
         color = (0, 0, 255)
+    else:
+        color = (0, 255, 255)
 
     cv2.putText(frame, f"Reps: {r['reps']}", (20, 40), 0, 0.8, color, 2)
     cv2.putText(frame, f"Form: {r['form']}", (20, 70), 0, 0.7, color, 2)
