@@ -1,0 +1,1 @@
+print("X shape:", x.shape, "Y:", y)
